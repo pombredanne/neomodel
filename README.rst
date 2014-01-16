@@ -8,7 +8,7 @@ Don't need an OGM? Try the awesome py2neo_ (which this library is built on).
 .. _py2neo: http://www.py2neo.org
 .. _neo4j: http://www.neo4j.org
 
-Supports: neo4j 1.8+ (1.9 recommended), python 2.7, 3.3
+Supports: neo4j 1.8+ (1.9 recommended), not version 2.0 just yet. python 2.7, 3.3
 
 .. image:: https://secure.travis-ci.org/robinedwards/neomodel.png
    :target: https://secure.travis-ci.org/robinedwards/neomodel/
@@ -189,8 +189,12 @@ this inflates py2neo nodes to neomodel node objects::
 
     class Person(StructuredNode):
         def friends(self):
-            results, metadata = self.cypher("START a=node({self}) MATCH a-[:FRIEND]->(b) RETURN b");
+            results, columns = self.cypher("START a=node({self}) MATCH a-[:FRIEND]->(b) RETURN b")
             return [self.__class__.inflate(row[0]) for row in results]
+
+    # for standalone queries
+    from neomodel import cypher_query
+    cypher_query(query, params)
 
 The self query parameter is prepopulated with the current node id. It's possible to pass in your
 own query parameters to the cypher method.

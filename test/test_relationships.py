@@ -92,9 +92,9 @@ def test_either_direction_connect():
     assert sakis.knows.is_connected(rey)
     sakis.knows.connect(rey)
 
-    result, _ = sakis.cypher("""START us=node({self}), them=node({them})
+    result, meta = sakis.cypher("""START us=node({self}), them=node({them})
             MATCH (us)-[r:KNOWS]-(them) RETURN COUNT(r)""",
-            {'them': rey.__node__.id})
+            {'them': rey.__node__._id})
     assert int(result[0][0]) == 1
 
 
@@ -154,14 +154,14 @@ def test_props_relationship():
     assert c.inhabitant.is_connected(u)
 
     # Check if properties were inserted
-    result = u.cypher('START root=node:Person(name={name})' +
-        ' MATCH root-[r:IS_FROM]->() RETURN r.city', {'name': u.name})[0]
+    result, meta = u.cypher('START root=node:Person(name={name})' +
+        ' MATCH root-[r:IS_FROM]->() RETURN r.city', {'name': u.name})
     assert result and result[0][0] == 'Thessaloniki'
 
     u.is_from.reconnect(c, c2)
     assert u.is_from.is_connected(c2)
 
     # Check if properties are transferred correctly
-    result = u.cypher('START root=node:Person(name={name})' +
-        ' MATCH root-[r:IS_FROM]->() RETURN r.city', {'name': u.name})[0]
+    result, meta = u.cypher('START root=node:Person(name={name})' +
+        ' MATCH root-[r:IS_FROM]->() RETURN r.city', {'name': u.name})
     assert result and result[0][0] == 'Thessaloniki'

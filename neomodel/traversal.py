@@ -36,11 +36,11 @@ def last_x_in_ast(ast, x):
 
 def unique_placeholder(placeholder, query_params):
         i = 0
-        while placeholder in query_params:
-            if placeholder + '_' + i in query_params:
-                return placeholder + '_' + i
+        new_placeholder = "{}_{}".format(placeholder, i)
+        while new_placeholder in query_params:
             i += 1
-        return placeholder
+            new_placeholder = "{}_{}".format(placeholder, i)
+        return new_placeholder
 
 
 class AstBuilder(object):
@@ -49,7 +49,6 @@ class AstBuilder(object):
         self.start_node = start_node
         self.ident_count = 0
         self.query_params = {}
-        assert hasattr(self.start_node, '__node__')
         self.ast = [{'start': '{self}',
             'class': self.start_node.__class__, 'name': 'origin'}]
         self.origin_is_category = start_node.__class__.__name__ == 'CategoryNode'
@@ -58,6 +57,9 @@ class AstBuilder(object):
         if len(self.ast) > 1:
             t = self._find_map(self.ast[-2]['target_map'], rel_manager)
         else:
+            if not hasattr(self.start_node, rel_manager):
+                    raise AttributeError("{} class has no relationship definition '{}' to traverse.".format(
+                        self.start_node.__class__.__name__, rel_manager))
             t = getattr(self.start_node, rel_manager).definition
             t['name'] = rel_manager
 
@@ -232,7 +234,7 @@ class AstBuilder(object):
                 if not ('limit' in entry or 'skip' in entry):
                     ast.insert(len(ast) - i, self.order_part)
                     break
-        results, _ = self.start_node.cypher(Query(ast), self.query_params)
+        results, meta = self.start_node.cypher(Query(ast), self.query_params)
         self.last_ast = ast
         return results
 
@@ -250,7 +252,7 @@ class TraversalSet(AstBuilder):
         super(TraversalSet, self).__init__(start_node)
 
     def traverse(self, rel, *where_stmts):
-        if not self.start_node.__node__:
+        if self.start_node.__node__ is None:
             raise Exception("Cannot traverse unsaved node")
         self._traverse(rel, where_stmts)
         return self
