@@ -1,3 +1,19 @@
+Version 1.0.3 unreleased
+ * add support for choices on string properites.
+
+Version 1.0.2 2014-10-21
+ * updated documentation
+ * sphinx and rtd
+ * exception handling in cypher fix (tjakobsen)
+
+Version 1.0.1 2014-08-21
+ * support for transactions
+ * new nodes class property (match API)
+ * support for neo4j 2
+ * no support for neo4j < 2
+ * deprecated category nodes
+ * deprecated index property
+
 Version 0.4.0 unreleased
  * server compatability check (Robin Edwards)
  * 1.9 server fixes (Robin Edwards)

@@ -1,6 +1,5 @@
-from .exception import InflateError, DeflateError, RequiredProperty, NoSuchProperty
+from .exception import InflateError, DeflateError, RequiredProperty
 from datetime import datetime, date
-from .relationship_manager import RelationshipDefinition, RelationshipManager
 import os
 import types
 import pytz
@@ -13,66 +12,79 @@ logger = logging.getLogger(__name__)
 if sys.version_info >= (3, 0):
     unicode = lambda x: str(x)
 
+def display_for(key):
+    def display_choice(self):
+        return getattr(self.__class__, key).choice_map[getattr(self, key)]
+    return display_choice
 
 class PropertyManager(object):
     """Common stuff for handling properties in nodes and relationships"""
     def __init__(self, *args, **kwargs):
-        for key, val in self._class_properties().items():
-            if val.__class__ is RelationshipDefinition:
-                self.__dict__[key] = val.build_manager(self, key)
+
+        for key, val in self.defined_properties(rels=False, aliases=False).items():
             # handle default values
-            elif isinstance(val, (Property,)) and not isinstance(val, (AliasProperty,)):
-                if not key in kwargs or kwargs[key] is None:
-                    if val.has_default:
-                        kwargs[key] = val.default_value()
-        for key, value in kwargs.items():
-            if not(key.startswith("__") and key.endswith("__")):
-                setattr(self, key, value)
+            if key not in kwargs or kwargs[key] is None:
+                if hasattr(val, 'has_default') and val.has_default:
+                    setattr(self, key, val.default_value())
+                else:
+                    setattr(self, key, None)
+            else:
+                setattr(self, key, kwargs[key])
+
+            if hasattr(val, 'choices') and getattr(val, 'choices'):
+                setattr(self, 'get_{}_display'.format(key),
+                        types.MethodType(display_for(key), self))
+
+            if key in kwargs:
+                del kwargs[key]
+
+        # aliases next so they don't have their alias over written
+        for key, val in self.defined_properties(rels=False, properties=False).items():
+            if key in kwargs:
+                setattr(self, key, kwargs[key])
+                del kwargs[key]
+
+        # undefined properties last (for magic @prop.setters etc)
+        for key, val in kwargs.items():
+            setattr(self, key, val)
 
     @property
     def __properties__(self):
-        node_props = {}
+        from .relationship_manager import RelationshipManager
+        props = {}
         for key, value in self.__dict__.items():
-            if not (key.startswith('_') or value is None
+            if not (key.startswith('_')
                     or isinstance(value,
                         (types.MethodType, RelationshipManager, AliasProperty,))):
-                node_props[key] = value
-        return node_props
+                props[key] = value
+        return props
 
     @classmethod
     def deflate(cls, obj_props, obj=None):
         """ deflate dict ready to be stored """
         deflated = {}
-        for key, prop in cls._class_properties().items():
-            if (not isinstance(prop, AliasProperty)
-                    and issubclass(prop.__class__, Property)):
-                if key in obj_props and obj_props[key] is not None:
-                    deflated[key] = prop.deflate(obj_props[key], obj)
-                elif prop.has_default:
-                    deflated[key] = prop.deflate(prop.default_value(), obj)
-                elif prop.required:
-                    raise RequiredProperty(key, cls)
+        for key, prop in cls.defined_properties(aliases=False, rels=False).items():
+            if key in obj_props and obj_props[key] is not None:
+                deflated[key] = prop.deflate(obj_props[key], obj)
+            elif prop.has_default:
+                deflated[key] = prop.deflate(prop.default_value(), obj)
+            elif prop.required:
+                raise RequiredProperty(key, cls)
+            else:
+                deflated[key] = None
         return deflated
 
     @classmethod
-    def get_property(cls, name):
-        try:
-            neo_property = getattr(cls, name)
-        except AttributeError:
-            raise NoSuchProperty(name, cls)
-        if not issubclass(neo_property.__class__, Property)\
-                or not issubclass(neo_property.__class__, AliasProperty):
-            NoSuchProperty(name, cls)
-        return neo_property
-
-    @classmethod
-    def _class_properties(cls):
-        # get all dict values for inherited classes
-        # reverse is done to keep inheritance order
+    def defined_properties(cls, aliases=True, properties=True, rels=True):
+        from .relationship_manager import RelationshipDefinition
         props = {}
         for scls in reversed(cls.mro()):
-            for key, value in scls.__dict__.items():
-                props[key] = value
+            for key, prop in scls.__dict__.items():
+                if ((aliases and isinstance(prop, AliasProperty))
+                        or (properties and issubclass(prop.__class__, Property)
+                            and not isinstance(prop, AliasProperty))
+                        or (rels and isinstance(prop, RelationshipDefinition))):
+                    props[key] = prop
         return props
 
 
@@ -95,7 +107,7 @@ def validator(fn):
 
 
 class Property(object):
-    def __init__(self, unique_index=False, index=False, required=False, default=None):
+    def __init__(self, unique_index=False, index=False, required=False, default=None, **kwargs):
         if default and required:
             raise Exception("required and default are mutually exclusive")
 
@@ -123,12 +135,30 @@ class Property(object):
 
 
 class StringProperty(Property):
+    def __init__(self, **kwargs):
+        super(StringProperty, self).__init__(**kwargs)
+        self.choices = kwargs.get('choices', None)
+
+        if self.choices:
+            if not isinstance(self.choices, tuple):
+                raise ValueError("Choices must be a tuple of tuples")
+
+            self.choice_map = dict(self.choices)
+
     @validator
     def inflate(self, value):
+        if self.choices and value not in self.choice_map:
+            raise ValueError("Invalid choice {} not in {}".format(
+                value, ', '.join(self.choice_map.keys())))
+
         return unicode(value)
 
     @validator
     def deflate(self, value):
+        if self.choices and value not in self.choice_map:
+            raise ValueError("Invalid choice {} not in {}".format(
+                value, ','.join(self.choice_map.keys())))
+
         return unicode(value)
 
     def default_value(self):
@@ -146,6 +176,19 @@ class IntegerProperty(Property):
 
     def default_value(self):
         return int(super(IntegerProperty, self).default_value())
+
+
+class ArrayProperty(Property):
+    @validator
+    def inflate(self, value):
+        return list(value)
+
+    @validator
+    def deflate(self, value):
+        return list(value)
+
+    def default_value(self):
+        return list(super(ArrayProperty, self).default_value())
 
 
 class FloatProperty(Property):
@@ -204,16 +247,19 @@ class DateTimeProperty(Property):
             raise ValueError('datetime object expected, got {0}'.format(value))
         if value.tzinfo:
             value = value.astimezone(pytz.utc)
-            epoch_date = datetime(1970,1,1,tzinfo=pytz.utc)
+            epoch_date = datetime(1970, 1, 1, tzinfo=pytz.utc)
         elif os.environ.get('NEOMODEL_FORCE_TIMEZONE', False):
             raise ValueError("Error deflating {} no timezone provided".format(value))
         else:
             logger.warning("No timezone sepecified on datetime object.. will be inflated to UTC")
-            epoch_date = datetime(1970,1,1)
+            epoch_date = datetime(1970, 1, 1)
         return float((value - epoch_date).total_seconds())
 
 
 class JSONProperty(Property):
+    def __init__(self, *args, **kwargs):
+        super(JSONProperty, self).__init__(*args, **kwargs)
+
     @validator
     def inflate(self, value):
         return json.loads(value)
