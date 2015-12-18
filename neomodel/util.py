@@ -4,10 +4,16 @@ import time
 import warnings
 import sys
 from threading import local
-from py2neo import neo4j
-from py2neo.exceptions import ClientError
+
+from py2neo import authenticate, Graph, Resource
+from py2neo.batch import CypherJob
+from py2neo.cypher import CypherTransaction, CypherResource, RecordList
+from py2neo.cypher.core import RecordProducer
+from py2neo.packages.httpstream.packages.urimagic import URI
+from py2neo.cypher.error import ClientError
 from py2neo.packages.httpstream import SocketError
-from py2neo import cypher as py2neo_cypher
+from py2neo.util import is_collection
+
 from .exception import CypherException, UniqueProperty, TransactionError
 if sys.version_info >= (3, 0):
     from urllib.parse import urlparse
@@ -16,16 +22,16 @@ else:
 
 logger = logging.getLogger(__name__)
 
-path_to_id = lambda val: int(neo4j.URI(val).path.segments[-1])
+path_to_id = lambda val: int(URI(val).path.segments[-1])
 
 
-class PatchedTransaction(py2neo_cypher.Transaction):
+class PatchedTransaction(CypherTransaction):
     def __init__(self, uri):
         super(PatchedTransaction, self).__init__(uri)
 
     def _post(self, resource):
-        self._assert_unfinished()
-        rs = resource._post({"statements": self._statements})
+        self.__assert_unfinished()
+        rs = resource.post({"statements": self.statements})
         headers = dict(rs.headers)
         location = None
         # when run in python 2 the keys in the header dictionary all start with lowercase letters
@@ -35,12 +41,12 @@ class PatchedTransaction(py2neo_cypher.Transaction):
         elif "Location" in headers:
             location = headers["Location"]
         if location is not None:
-            self._execute = py2neo_cypher.Resource(location)
+            self._execute = Resource(location)
         j = rs.json
         rs.close()
         self._clear()
         if "commit" in j:
-            self._commit = py2neo_cypher.Resource(j["commit"])
+            self._commit = Resource(j["commit"])
         if "errors" in j and len(j['errors']):
             error = j["errors"][0]
             txid = int(j['commit'].split('/')[-2])
@@ -48,7 +54,7 @@ class PatchedTransaction(py2neo_cypher.Transaction):
             raise TransactionError(error['message'], error['code'], trace, txid)
         out = []
         for result in j["results"]:
-            producer = py2neo_cypher.RecordProducer(result["columns"])
+            producer = RecordProducer(result["columns"])
             out.append([
                 producer.produce(_hydrated(r["rest"]))
                 for r in result["data"]
@@ -74,20 +80,20 @@ class Rel(object):
 def _hydrated(data):
     if isinstance(data, dict):
         if 'self' in data:
-            obj_type = neo4j.URI(data['self']).path.segments[-2]
+            obj_type = URI(data['self']).path.segments[-2]
             if obj_type == 'node':
                 return Node(data)
             elif obj_type == 'relationship':
                 return Rel(data)
         raise NotImplemented("Don't know how to inflate: " + repr(data))
-    elif neo4j.is_collection(data):
+    elif is_collection(data):
         return type(data)([_hydrated(datum) for datum in data])
     else:
         return data
 
-neo4j._hydrated = _hydrated
-py2neo_cypher._hydrated = _hydrated
-py2neo_cypher.Transaction = PatchedTransaction
+Graph._hydrated = _hydrated
+CypherResource._hydrated = _hydrated
+CypherTransaction = PatchedTransaction
 
 
 class Database(local):
@@ -97,16 +103,16 @@ class Database(local):
 
         u = urlparse(_url)
         if u.netloc.find('@') > -1:
-            credentials, self.host = u.netloc.split('@')
+            credentials, self.host = u.netloc.rsplit('@', 1)
             self.user, self.password, = credentials.split(':')
             self.url = ''.join([u.scheme, '://', self.host, u.path, u.query])
-            neo4j.authenticate(self.host, self.user, self.password)
+            authenticate(self.host, self.user, self.password)
         else:
             self.url = _url
 
     def new_session(self):
         try:
-            self.session = neo4j.GraphDatabaseService(self.url)
+            self.session = Graph(self.url)
         except SocketError as e:
             raise SocketError("Error connecting to {0} - {1}".format(self.url, e))
 
@@ -164,7 +170,11 @@ class Database(local):
         if hasattr(self, 'tx_session'):
             raise SystemError("Transaction already in progress")
 
-        self.tx_session = py2neo_cypher.Session(self.url).create_transaction()
+        # make sure thread local session is set
+        if not hasattr(self, 'session'):
+            self.new_session()
+
+        self.tx_session = self.session.cypher.begin()
 
     def commit(self):
         if not hasattr(self, 'tx_session'):
@@ -184,17 +194,16 @@ class Database(local):
     def _execute_query(self, query, params):
         if hasattr(self, 'tx_session'):
             self.tx_session.append(query, params or {})
-            results = self.tx_session.execute()[0]
+            results = self.tx_session.process()[0]
             if results:
-                return [list(r.values) for r in results], list(results[0].columns)
+                return results, list(results.columns)
             else:
                 return [], None
         else:
             if not hasattr(self, 'session'):
                 self.new_session()
-            cq = neo4j.CypherQuery(self.session, '')
-            result = neo4j.CypherResults(cq._cypher._post({'query': query, 'params': params or {}}))
-            return [list(r.values) for r in result.data], list(result.columns)
+            results = self.session.cypher.execute(query, params)
+            return results, list(results.columns)
 
     def cypher_query(self, query, params=None, handle_unique=True):
         try:
@@ -206,6 +215,9 @@ class Database(local):
                     and e.message.startswith('Node ')):
                 raise UniqueProperty(e.message)
 
+            if isinstance(e, ClientError):
+                raise e
+
             if isinstance(e, TransactionError):
                 raise CypherException(query, params, e.message, e.java_exception, e.java_trace)
 
@@ -216,6 +228,70 @@ class Database(local):
 
         return results
 
+    def cypher_stream_query(self, query, params=None):
+        """
+        Streams the provided query, and generates responses when iterated.
+
+        :param query:  A CYPHER query.
+        :type query: str
+        :param params: optional, key value params to pass into the query.
+        :type params: dict
+        :rtype: generator
+        """
+        # make sure thread local session is set
+        if not hasattr(self, 'session'):
+            self.new_session()
+
+        return self.session.cypher.stream(query, params)
+
+    def cypher_batch_query(self, queries, handle_unique=True):
+        """
+        Batch the provided queries, and returns all responses.
+
+        :param queries:  List of tuples, each with a (cypher query, params)
+        :type queries: list of tuples
+        :rtype: list of RecordList
+        """
+        tx_created = False
+        tx = getattr(self, 'tx_session', None)
+        # operation requires a transaction for batch processing
+        if not tx:
+            # make sure thread local session is set
+            if not hasattr(self, 'session'):
+                self.new_session()
+            tx = self.session.cypher.begin()
+            tx_created = True
+
+        try:
+            # process all queries
+            for q, params in queries:
+                tx.append(q, params)
+            results = tx.process()
+
+            # if tx was created internally, make sure to commit changes
+            if tx_created:
+                tx.commit()
+
+            return results
+        except (ClientError, TransactionError) as e:
+            # if tx was created internally, make try to rollback changes
+            if tx_created:
+                try:
+                    tx.rollback()
+                except:
+                    pass
+
+            if (handle_unique and e.message and " already exists with label " in e.message
+                    and e.message.startswith('Node ')):
+                raise UniqueProperty(e.message)
+
+            if isinstance(e, ClientError):
+                raise e
+
+            if isinstance(e, TransactionError):
+                raise CypherException(queries, {}, e.message, e.java_exception, e.java_trace)
+
+            raise CypherException(queries, {}, e.message, e.exception, e.stack_trace)
 
 def deprecated(message):
     def f__(f):

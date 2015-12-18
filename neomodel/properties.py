@@ -21,7 +21,10 @@ class PropertyManager(object):
     """Common stuff for handling properties in nodes and relationships"""
     def __init__(self, *args, **kwargs):
 
-        for key, val in self.defined_properties(rels=False, aliases=False).items():
+        properties = getattr(self, "__all_properties__", None)
+        if properties is None:
+            properties = self.defined_properties(rels=False, aliases=False).items()
+        for key, val in properties:
             # handle default values
             if key not in kwargs or kwargs[key] is None:
                 if hasattr(val, 'has_default') and val.has_default:
@@ -38,8 +41,11 @@ class PropertyManager(object):
             if key in kwargs:
                 del kwargs[key]
 
+        aliases = getattr(self, "__all_aliases__", None)
+        if aliases is None:
+            aliases = self.defined_properties(rels=False, properties=False).items()
         # aliases next so they don't have their alias over written
-        for key, val in self.defined_properties(rels=False, properties=False).items():
+        for key, val in aliases:
             if key in kwargs:
                 setattr(self, key, kwargs[key])
                 del kwargs[key]
@@ -60,18 +66,20 @@ class PropertyManager(object):
         return props
 
     @classmethod
-    def deflate(cls, obj_props, obj=None):
+    def deflate(cls, obj_props, obj=None, skip_empty=False):
         """ deflate dict ready to be stored """
         deflated = {}
         for key, prop in cls.defined_properties(aliases=False, rels=False).items():
+            # map property name to correct database property
+            db_property = prop.db_property or key
             if key in obj_props and obj_props[key] is not None:
-                deflated[key] = prop.deflate(obj_props[key], obj)
+                deflated[db_property] = prop.deflate(obj_props[key], obj)
             elif prop.has_default:
-                deflated[key] = prop.deflate(prop.default_value(), obj)
-            elif prop.required:
+                deflated[db_property] = prop.deflate(prop.default_value(), obj)
+            elif prop.required or prop.unique_index:
                 raise RequiredProperty(key, cls)
-            else:
-                deflated[key] = None
+            elif skip_empty is not True:
+                deflated[db_property] = None
         return deflated
 
     @classmethod
@@ -107,7 +115,7 @@ def validator(fn):
 
 
 class Property(object):
-    def __init__(self, unique_index=False, index=False, required=False, default=None, **kwargs):
+    def __init__(self, unique_index=False, index=False, required=False, default=None, db_property=None, **kwargs):
         if default and required:
             raise Exception("required and default are mutually exclusive")
 
@@ -119,6 +127,7 @@ class Property(object):
         self.index = index
         self.default = default
         self.has_default = True if self.default is not None else False
+        self.db_property = db_property  # define the name of the property in the database
 
     def default_value(self):
         if self.has_default:
